@@ -1,1 +1,14 @@
-p.webshare.io:80:xaqvfzxc-rotate:iqqjr4nzsgjg
+geo-dc.floppydata.com:10080:8ILnIwvDaQEkEaiV:sZq57S5Yoa6rKjSj
+geo-dc.floppydata.com:10080:v92l2sRmyzYRbJLc:b8ht4zoVT89qj3mL
+geo-dc.floppydata.com:10080:4V5oNb0dDu5ufq3s:tlBfX7GTGPQWkspx
+geo-dc.floppydata.com:10080:0LNVxdFeNtFMP9sx:3sgCKT9ovhlbUVqt
+geo-dc.floppydata.com:10080:sWWhlNq8AUgPvpwz:11JaAZmyoC9Qms3b
+geo-dc.floppydata.com:10080:amhBiXEakI7eKcYp:SFSEmtLPYp9YCPvC
+geo-dc.floppydata.com:10080:LKYgiYRKwZSPvjpH:oDmOlczuDo4oko1P
+geo-dc.floppydata.com:10080:VfYSzavW7cmu0cCq:Y15OnVf9X44aev9X
+geo-dc.floppydata.com:10080:0E2zvwYDoF5jfqYh:14H0c95vuJtJPtgn
+geo-dc.floppydata.com:10080:ugr7sDhVGCaEx6nm:mERQywPeiK06jIvW
+geo-dc.floppydata.com:10080:Iii5s9cRzzZANQgD:JDfPf8FuX7fd4GBZ
+geo-dc.floppydata.com:10080:Utj35FoW9Dj2cGhB:lG0zjDnJrTbLXClb
+geo-dc.floppydata.com:10080:cocUw6hO5qXxeV2H:pt74v8X4QqDplDUl
+geo-dc.floppydata.com:10080:PZw8m5rlU6PVQoq9:3UggqIw1zoAzBfu9
