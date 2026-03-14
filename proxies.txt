@@ -1,5 +1,1 @@
-geo.floppydata.com:10080:Rcv49WEHU5rwx13N:kliBhI9FuyvCc24Y
-geo.floppydata.com:10080:Sk1nwEKKHdhscezi:fKUHc196uVgOk3nR
-geo.floppydata.com:10080:gzxnUhOBl1V3NGYS:3WJ0dnOOG5sJbndy
-geo.floppydata.com:10080:urssOcIBi8EhvXSo:oZjrnxF2AN4pLAtq
-geo.floppydata.com:10080:1BbRvy3N9kDE6Fy2:gYNfARhtbObImYxR
+p.webshare.io:80:xaqvfzxc-rotate:iqqjr4nzsgjg
