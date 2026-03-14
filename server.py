@@ -37,12 +37,28 @@ class ProxyPool:
         try:
             with open(self.path) as f:
                 lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-            # Normalise — ensure scheme present
+            # Normalise — handle formats:
+            #   host:port
+            #   host:port:user:pass
+            #   http://host:port
+            #   http://user:pass@host:port
             normalised = []
             for line in lines:
-                if not line.startswith("http"):
-                    line = "http://" + line
-                normalised.append(line)
+                if line.startswith("http"):
+                    # Already a URL — use as-is
+                    normalised.append(line)
+                else:
+                    parts = line.split(":")
+                    if len(parts) == 4:
+                        # host:port:user:pass
+                        host, port, user, passwd = parts
+                        normalised.append(f"http://{user}:{passwd}@{host}:{port}")
+                    elif len(parts) == 2:
+                        # host:port
+                        normalised.append(f"http://{line}")
+                    else:
+                        # Unknown — try as-is with scheme
+                        normalised.append(f"http://{line}")
             self.proxies = normalised
             self._cycle = cycle(self.proxies)
             log.info(f"Loaded {len(self.proxies)} proxies from {self.path}")
