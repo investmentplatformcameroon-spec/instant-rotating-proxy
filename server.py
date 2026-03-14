@@ -1,10 +1,8 @@
 import asyncio
-import aiohttp
+import base64
 import logging
 import os
 import random
-import socket
-import time
 from itertools import cycle
 from urllib.parse import urlparse
 
@@ -14,84 +12,71 @@ logging.basicConfig(
 )
 log = logging.getLogger("proxy-rotator")
 
-PROXIES_FILE = os.getenv("PROXIES_FILE", "proxies.txt")
-ROTATION_MODE = os.getenv("ROTATION_MODE", "round-robin")  # round-robin | random
-HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", 8080))
+PROXIES_FILE    = os.getenv("PROXIES_FILE", "proxies.txt")
+ROTATION_MODE   = os.getenv("ROTATION_MODE", "round-robin")
+HOST            = os.getenv("HOST", "0.0.0.0")
+PORT            = int(os.getenv("PORT", 8080))
 CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", 10))
-AUTH_USER = os.getenv("AUTH_USER", "")
-AUTH_PASS = os.getenv("AUTH_PASS", "")
+AUTH_USER       = os.getenv("AUTH_USER", "")
+AUTH_PASS       = os.getenv("AUTH_PASS", "")
 
-# ── Proxy pool ──────────────────────────────────────────────────────────────
+# ── Proxy pool ───────────────────────────────────────────────────────────────
 
 class ProxyPool:
     def __init__(self, path: str):
-        self.path = path
-        self.proxies: list[str] = []
+        self.proxies: list[dict] = []
         self._cycle = None
-        self._lock = asyncio.Lock()
-        self.stats: dict[str, dict] = {}  # per-proxy hit/fail counts
-        self.load()
+        self.load(path)
 
-    def load(self):
+    def load(self, path: str):
         try:
-            with open(self.path) as f:
+            with open(path) as f:
                 lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-            # Normalise — handle formats:
-            #   host:port
-            #   host:port:user:pass
-            #   http://host:port
-            #   http://user:pass@host:port
-            normalised = []
+            result = []
             for line in lines:
-                if line.startswith("http"):
-                    # Already a URL — use as-is
-                    normalised.append(line)
-                else:
-                    parts = line.split(":")
-                    if len(parts) == 4:
-                        # host:port:user:pass
-                        host, port, user, passwd = parts
-                        normalised.append(f"http://{user}:{passwd}@{host}:{port}")
-                    elif len(parts) == 2:
-                        # host:port
-                        normalised.append(f"http://{line}")
-                    else:
-                        # Unknown — try as-is with scheme
-                        normalised.append(f"http://{line}")
-            self.proxies = normalised
+                p = self._parse(line)
+                if p:
+                    result.append(p)
+            self.proxies = result
             self._cycle = cycle(self.proxies)
-            log.info(f"Loaded {len(self.proxies)} proxies from {self.path}")
+            log.info(f"Loaded {len(self.proxies)} proxies from {path}")
         except FileNotFoundError:
-            log.warning(f"{self.path} not found — starting with empty pool")
+            log.warning(f"{path} not found")
 
-    def reload(self):
-        self.load()
+    def _parse(self, line: str) -> dict | None:
+        try:
+            if not line.startswith("http"):
+                parts = line.split(":")
+                if len(parts) == 4:
+                    return {"host": parts[0], "port": int(parts[1]), "user": parts[2], "passwd": parts[3]}
+                if len(parts) == 2:
+                    return {"host": parts[0], "port": int(parts[1]), "user": "", "passwd": ""}
+            u = urlparse(line)
+            return {"host": u.hostname, "port": u.port or 3128, "user": u.username or "", "passwd": u.password or ""}
+        except Exception:
+            return None
 
-    def next(self) -> str | None:
+    def next(self) -> dict | None:
         if not self.proxies:
             return None
         if ROTATION_MODE == "random":
             return random.choice(self.proxies)
         return next(self._cycle)
 
-    def record(self, proxy: str, success: bool):
-        s = self.stats.setdefault(proxy, {"ok": 0, "fail": 0})
-        if success:
-            s["ok"] += 1
-        else:
-            s["fail"] += 1
-
 
 pool = ProxyPool(PROXIES_FILE)
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-# ── Auth helper ─────────────────────────────────────────────────────────────
+def make_proxy_auth_header(proxy: dict) -> str:
+    if proxy["user"]:
+        creds = base64.b64encode(f"{proxy['user']}:{proxy['passwd']}".encode()).decode()
+        return f"Proxy-Authorization: Basic {creds}\r\n"
+    return ""
 
-def check_proxy_auth(headers: dict) -> bool:
+def check_client_auth(headers: dict) -> bool:
     if not AUTH_USER:
         return True
-    import base64
     auth = headers.get(b"proxy-authorization", b"").decode(errors="ignore")
     if not auth.lower().startswith("basic "):
         return False
@@ -101,9 +86,6 @@ def check_proxy_auth(headers: dict) -> bool:
         return user == AUTH_USER and passwd == AUTH_PASS
     except Exception:
         return False
-
-
-# ── Core tunnel ─────────────────────────────────────────────────────────────
 
 async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     try:
@@ -121,56 +103,57 @@ async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         except Exception:
             pass
 
+# ── HTTPS CONNECT tunnel ─────────────────────────────────────────────────────
 
 async def handle_connect(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
     target_host: str,
     target_port: int,
-    upstream: str | None,
+    proxy: dict,
 ):
-    """Handle HTTPS CONNECT tunnelling, optionally via upstream proxy."""
-    proxy = None
     up_reader = up_writer = None
     try:
-        if upstream:
-            parsed = urlparse(upstream)
-            up_host = parsed.hostname
-            up_port = parsed.port or 3128
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(up_host, up_port),
-                timeout=CONNECT_TIMEOUT,
-            )
-            # Send our own CONNECT to the upstream proxy
-            connect_req = (
-                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n\r\n"
-            ).encode()
-            up_writer.write(connect_req)
-            await up_writer.drain()
-            # Read upstream response
-            resp = await asyncio.wait_for(up_reader.readuntil(b"\r\n\r\n"), timeout=CONNECT_TIMEOUT)
-            if b"200" not in resp:
-                raise ConnectionError(f"Upstream CONNECT failed: {resp[:80]}")
-            proxy = upstream
-        else:
-            up_reader, up_writer = await asyncio.wait_for(
-                asyncio.open_connection(target_host, target_port),
-                timeout=CONNECT_TIMEOUT,
-            )
+        # Open TCP to upstream proxy
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy["host"], proxy["port"]),
+            timeout=CONNECT_TIMEOUT,
+        )
 
+        # Send CONNECT with Proxy-Authorization — this is what was missing
+        auth = make_proxy_auth_header(proxy)
+        request = (
+            f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+            f"Host: {target_host}:{target_port}\r\n"
+            f"{auth}"
+            f"\r\n"
+        ).encode()
+        up_writer.write(request)
+        await up_writer.drain()
+
+        # Read upstream response
+        response = await asyncio.wait_for(
+            up_reader.readuntil(b"\r\n\r\n"),
+            timeout=CONNECT_TIMEOUT,
+        )
+
+        if b"200" not in response.split(b"\r\n")[0]:
+            raise ConnectionError(f"Upstream rejected CONNECT: {response[:100]}")
+
+        # Tell client tunnel is open
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
 
+        log.info(f"CONNECT {target_host}:{target_port} via {proxy['host']}:{proxy['port']}")
+
+        # Pipe data both ways
         await asyncio.gather(
             pipe(client_reader, up_writer),
             pipe(up_reader, client_writer),
         )
-        pool.record(upstream or "direct", True)
+
     except Exception as e:
-        log.debug(f"CONNECT tunnel error ({target_host}:{target_port}): {e}")
-        if upstream:
-            pool.record(upstream, False)
+        log.warning(f"CONNECT failed ({target_host}:{target_port} via {proxy['host']}): {e}")
         try:
             client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             await client_writer.drain()
@@ -184,67 +167,74 @@ async def handle_connect(
                 except Exception:
                     pass
 
+# ── HTTP forward ─────────────────────────────────────────────────────────────
 
 async def handle_http(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
-    method: str,
-    url: str,
-    http_version: str,
-    raw_headers: bytes,
-    upstream: str | None,
+    first_line: str,
+    headers_raw: bytes,
+    proxy: dict,
 ):
-    """Forward plain HTTP requests via upstream proxy or directly."""
-    proxies = {upstream: upstream} if upstream else None
+    up_reader = up_writer = None
     try:
-        timeout = aiohttp.ClientTimeout(total=30, connect=CONNECT_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Rebuild headers dict
-            headers = {}
-            for line in raw_headers.split(b"\r\n"):
-                if b": " in line:
-                    k, _, v = line.partition(b": ")
-                    key = k.decode(errors="ignore").lower()
-                    if key not in ("proxy-authorization", "proxy-connection"):
-                        headers[k.decode(errors="ignore")] = v.decode(errors="ignore")
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy["host"], proxy["port"]),
+            timeout=CONNECT_TIMEOUT,
+        )
 
-            proxy_url = upstream if upstream else None
-            async with session.request(
-                method, url, headers=headers, proxy=proxy_url, allow_redirects=False
-            ) as resp:
-                status_line = f"HTTP/1.1 {resp.status} {resp.reason}\r\n"
-                client_writer.write(status_line.encode())
-                for k, v in resp.headers.items():
-                    if k.lower() not in ("transfer-encoding",):
-                        client_writer.write(f"{k}: {v}\r\n".encode())
-                client_writer.write(b"\r\n")
-                async for chunk in resp.content.iter_chunked(65536):
-                    client_writer.write(chunk)
-                await client_writer.drain()
-        pool.record(upstream or "direct", True)
+        # Strip client proxy headers, inject upstream auth
+        clean_headers = []
+        for line in headers_raw.split(b"\r\n"):
+            lower = line.lower()
+            if lower.startswith(b"proxy-authorization") or lower.startswith(b"proxy-connection"):
+                continue
+            if line:
+                clean_headers.append(line)
+
+        auth = make_proxy_auth_header(proxy)
+        if auth:
+            clean_headers.append(auth.strip().encode())
+
+        request = (first_line + "\r\n").encode()
+        request += b"\r\n".join(clean_headers)
+        request += b"\r\n\r\n"
+
+        up_writer.write(request)
+        await up_writer.drain()
+
+        log.info(f"HTTP {first_line} via {proxy['host']}:{proxy['port']}")
+
+        await asyncio.gather(
+            pipe(up_reader, client_writer),
+            pipe(client_reader, up_writer),
+        )
+
     except Exception as e:
-        log.debug(f"HTTP forward error ({url}): {e}")
-        if upstream:
-            pool.record(upstream, False)
+        log.warning(f"HTTP failed: {e}")
         try:
             client_writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             await client_writer.drain()
         except Exception:
             pass
     finally:
-        try:
-            client_writer.close()
-        except Exception:
-            pass
+        for w in (client_writer, up_writer):
+            if w:
+                try:
+                    w.close()
+                except Exception:
+                    pass
 
-
-# ── Connection handler ───────────────────────────────────────────────────────
+# ── Main connection handler ───────────────────────────────────────────────────
 
 async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
     try:
         raw = await asyncio.wait_for(client_reader.readuntil(b"\r\n\r\n"), timeout=15)
     except Exception:
-        client_writer.close()
+        try:
+            client_writer.close()
+        except Exception:
+            pass
         return
 
     lines = raw.split(b"\r\n")
@@ -252,76 +242,51 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
         client_writer.close()
         return
 
-    request_line = lines[0].decode(errors="ignore")
-    parts = request_line.split(" ")
-    if len(parts) < 3:
+    first_line = lines[0].decode(errors="ignore").strip()
+    parts = first_line.split(" ")
+    if len(parts) < 2:
         client_writer.close()
         return
 
-    method, url, version = parts[0], parts[1], parts[2]
+    method = parts[0].upper()
+    url = parts[1]
     headers_raw = b"\r\n".join(lines[1:])
+
     headers_dict = {}
     for line in lines[1:]:
-        if b": " in line:
-            k, _, v = line.partition(b": ")
-            headers_dict[k.lower()] = v
+        if b":" in line:
+            k, _, v = line.partition(b":")
+            headers_dict[k.strip().lower()] = v.strip()
 
-    # Optional auth gate
-    if not check_proxy_auth(headers_dict):
+    if not check_client_auth(headers_dict):
         client_writer.write(
             b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-            b'Proxy-Authenticate: Basic realm="proxy"\r\n\r\n'
+            b"Proxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n"
         )
         await client_writer.drain()
         client_writer.close()
         return
 
-    upstream = pool.next()
+    proxy = pool.next()
+    if not proxy:
+        client_writer.write(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+        await client_writer.drain()
+        client_writer.close()
+        return
 
-    if method.upper() == "CONNECT":
+    if method == "CONNECT":
         host, _, port = url.partition(":")
         port = int(port) if port else 443
-        await handle_connect(client_reader, client_writer, host, port, upstream)
+        await handle_connect(client_reader, client_writer, host, port, proxy)
     else:
-        await handle_http(client_reader, client_writer, method, url, version, headers_raw, upstream)
+        await handle_http(client_reader, client_writer, first_line, headers_raw, proxy)
 
 
-# ── Stats endpoint (tiny HTTP on PORT+1) ────────────────────────────────────
-
-async def stats_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    try:
-        await reader.readuntil(b"\r\n\r\n")
-    except Exception:
-        pass
-    total_ok = sum(v["ok"] for v in pool.stats.values())
-    total_fail = sum(v["fail"] for v in pool.stats.values())
-    body = (
-        f"proxies_loaded: {len(pool.proxies)}\n"
-        f"requests_ok: {total_ok}\n"
-        f"requests_fail: {total_fail}\n"
-        f"rotation_mode: {ROTATION_MODE}\n"
-    )
-    writer.write(
-        f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\n\r\n{body}".encode()
-    )
-    await writer.drain()
-    writer.close()
-
-
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
     server = await asyncio.start_server(handle_client, HOST, PORT)
-    log.info(f"Proxy rotator listening on {HOST}:{PORT}  (mode={ROTATION_MODE})")
-
-    stats_port = PORT + 1
-    try:
-        stats_server = await asyncio.start_server(stats_handler, HOST, stats_port)
-        log.info(f"Stats endpoint on {HOST}:{stats_port}")
-    except OSError:
-        stats_server = None
-        log.warning(f"Could not bind stats port {stats_port}")
-
+    log.info(f"Proxy rotator listening on {HOST}:{PORT} (mode={ROTATION_MODE})")
     async with server:
         await server.serve_forever()
 
